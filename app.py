@@ -2,97 +2,94 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import re
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-# --- REGISTRY: All your scrapers / plug-ins talk to Hub, Hub talks to them ---
-# Add new plug-ins here, frontend never needs to change
-PLUGINS = {
-    "specialist": "https://garden-route-specialist-api.vercel.app/api/plan",
-    # When you have separate scrapers, add them here:
-    # "events": "https://your-events-scraper.vercel.app/api/events",
-    # "restaurants": "https://your-restaurants-scraper.vercel.app/api/restaurants",
-    # "weather": "https://your-weather-plugin.vercel.app/api/weather",
-}
+# Use env var first, fallback to hardcoded so it still works
+SPECIALIST_BASE = os.environ.get("SPECIALIST_URL", "https://garden-route-specialist-api.vercel.app").rstrip("/")
+SPECIALIST_PLAN_URL = f"{SPECIALIST_BASE}/api/plan"
+SPECIALIST_CHAT_URL = f"{SPECIALIST_BASE}/api/chat"
 
-def call_plugin(name, payload, timeout=15):
-    url = PLUGINS.get(name)
-    if not url:
-        return None
+def call_specialist(url, payload, timeout=25):
     try:
         r = requests.post(url, json=payload, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
+        # Return EVERYTHING, even errors, so we can debug
+        try:
+            body = r.json()
+        except:
+            body = {"raw": r.text[:500]}
+        return {"status": r.status_code, "body": body}
     except Exception as e:
-        print(f"Plugin {name} failed: {e}")
-    return None
+        return {"status": 0, "body": {"error": str(e)}}
 
 def parse_query(q):
-    q = q.lower()
-    # Find town
+    q = (q or "").lower()
     towns = ["knysna", "plett", "plettenberg", "george", "wilderness", "sedgefield", "oudtshoorn", "mossel bay", "hermanus", "tsitsikamma", "nature's valley", "rheenendal"]
     town = "Knysna"
     for t in towns:
         if t in q:
             town = t.title()
             break
-    # Find days - "2 days", "3 day"
     m = re.search(r"(\d+)\s*day", q)
     days = int(m.group(1)) if m else 2
     return town, days
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "plugins": list(PLUGINS.keys())})
+    return jsonify({"status": "ok", "specialist_url": SPECIALIST_BASE, "specialist_plan_url": SPECIALIST_PLAN_URL})
 
-@app.route("/api/plan", methods=["POST"])
+@app.route("/api/plan", methods=["POST", "OPTIONS"])
 def plan():
-    data = request.get_json() or {}
-    query = data.get("query", "") or data.get("town", "")
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    # Accept ALL frontend formats: {query} OR {town, days} OR {message}
+    query = data.get("query") or data.get("message") or data.get("prompt") or ""
     town = data.get("town")
     days = data.get("days", 2)
+    if not town:
+        town, days = parse_query(query if query else f"{town} {days} days")
+    if isinstance(days, str):
+        try: days = int(days)
+        except: days = 2
 
-    if not town and query:
-        town, days = parse_query(query)
+    result = call_specialist(SPECIALIST_PLAN_URL, {"town": town, "days": days, "query": query})
 
-    # 1. Ask Specialist for the plan
-    specialist_result = call_plugin("specialist", {"town": town, "days": days})
+    if result["status"] == 200:
+        return jsonify({"source": "hub -> specialist", "town": town, "days": days, "plan": result["body"], "events": [], "restaurants": []})
 
-    # 2. Later: also ask events / restaurants and combine here
-    # events = call_plugin("events", {"town": town, "days": days})
+    # NOW you will actually see WHY it failed
+    return jsonify({"error": "Specialist failed", "specialist_status": result["status"], "specialist_body": result["body"], "tried_url": SPECIALIST_PLAN_URL, "town": town, "days": days}), 502
 
-    if specialist_result:
-        return jsonify({
-            "source": "hub -> specialist",
-            "town": town,
-            "days": days,
-            "plan": specialist_result,
-            "events": [],
-            "restaurants": []
-        })
-
-    return jsonify({"error": "Specialist offline", "town": town, "days": days}), 503
-
-@app.route("/api/search", methods=["POST"])
-def search():
-    # This is the ONE endpoint your frontend will use for everything
-    data = request.get_json() or {}
-    query = data.get("query", "")
-    town, days = parse_query(query)
-
-    # If user wants a plan, route to Specialist
-    if "plan" in query.lower() or "itinerary" in query.lower() or "days in" in query.lower():
+@app.route("/api/chat", methods=["POST", "OPTIONS"])
+def chat():
+    # This was missing - this is what Garden Route AI calls
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    query = data.get("query") or data.get("message") or data.get("prompt") or ""
+    # If it's a plan request, route to plan logic
+    if any(w in query.lower() for w in ["plan", "itinerary", "days in", "day in"]):
         return plan()
+    # Otherwise forward to Specialist chat if it has it, else fallback to plan
+    result = call_specialist(SPECIALIST_CHAT_URL, {"query": query, "message": query})
+    if result["status"] == 200:
+        return jsonify(result["body"])
+    # Fallback: try plan endpoint
+    return plan()
 
-    # Otherwise, just return town info for now - frontend uses local data
-    return jsonify({
-        "source": "hub",
-        "town": town,
-        "days": days,
-        "type": "events",
-        "message": f"Search local events for {town}"
-    })
+@app.route("/api/search", methods=["POST", "OPTIONS"])
+def search():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    query = data.get("query", "") or data.get("message", "")
+    town, days = parse_query(query)
+    if any(w in query.lower() for w in ["plan", "itinerary", "days in"]):
+        return plan()
+    return jsonify({"source": "hub", "town": town, "days": days, "type": "events", "message": f"Search local events for {town}"})
 
 if __name__ == "__main__":
     app.run()
